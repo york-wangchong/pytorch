@@ -130,10 +130,15 @@ struct Capsule {
 // they are marked `@private`, which hides them on the doxygen documentation for
 // this page.
 
-/// IValue (Interpreter Value) is a tagged union over the types supported by the
-/// TorchScript interpreter. IValues contain their values as an
-/// `IValue::Payload`, which holds primitive types (`int64_t`, `bool`, `double`,
-/// `Device`), as values and all other types as a `c10::intrusive_ptr`.
+/// IValue (Interpreter Value) is a tagged union over the types
+/// supported by the TorchScript interpreter. IValues contain their
+/// values as an `IValue::Payload`, which holds primitive types
+/// (`int64_t`, `bool`, `double`, `Device`) and `Tensor` as values,
+/// and all other types as a `c10::intrusive_ptr`. In order to
+/// optimize performance of the destructor and related operations by
+/// making the `Tensor` and `c10::intrusive_ptr` paths generate the
+/// same code, we represent a null `c10::intrusive_ptr` as
+/// `UndefinedTensorImpl::singleton()`, *not* `nullptr`.
 ///
 /// IValues are used as inputs to and outputs from the TorchScript interpreter.
 /// To retrieve the value contained within an IValue, use the `.toX()` methods,
@@ -159,27 +164,37 @@ struct Capsule {
 struct CAFFE2_API IValue final {
   IValue(const IValue& rhs)
       : IValue(rhs.payload, rhs.tag, rhs.is_intrusive_ptr) {
-    if (is_intrusive_ptr) {
+    if (is_intrusive_ptr && payload.as_intrusive_ptr != c10::UndefinedTensorImpl::singleton()) {
       c10::raw::intrusive_ptr::incref(payload.as_intrusive_ptr);
     }
   }
-  IValue(IValue&& rhs) noexcept : IValue() {
-    swap(rhs);
+
+  IValue(IValue&& rhs) noexcept : tag(rhs.tag), is_intrusive_ptr(rhs.is_intrusive_ptr) {
+    moveFrom(std::move(rhs));
+    rhs.tag = Tag::None;
+    rhs.is_intrusive_ptr = false;
   }
+
   /// @private [doxygen private]
   ~IValue() {
-    if (is_intrusive_ptr) {
-      c10::raw::intrusive_ptr::decref(payload.as_intrusive_ptr);
-    }
+    destroy();
   }
-  IValue& operator=(IValue&& rhs) & noexcept {
-    IValue(std::move(rhs)).swap(*this); // this also sets rhs to None
+
+  C10_ALWAYS_INLINE IValue& operator=(IValue&& rhs) & noexcept {
+    if (&rhs == this) {
+      return *this;
+    }
+
+    destroy();
+    moveFrom(std::move(rhs));
     return *this;
   }
+
   IValue& operator=(IValue const& rhs) & {
     IValue(rhs).swap(*this);
     return *this;
   }
+
   void dump() const;
 
   /**
@@ -283,12 +298,35 @@ struct CAFFE2_API IValue final {
       return 1;
     }
 
+    if (payload.as_intrusive_ptr == c10::UndefinedTensorImpl::singleton()) {
+      return 0;
+    }
     return c10::raw::intrusive_ptr::use_count(payload.as_intrusive_ptr);
   }
 
   /// @private [doxygen private]
   void swap(IValue& rhs) noexcept {
-    std::swap(payload, rhs.payload);
+    if (isTensor() && rhs.isTensor()) {
+      std::swap(payload.as_tensor, rhs.payload.as_tensor);
+    } else if (isTensor()) {
+      at::Tensor t = std::move(payload.as_tensor);
+      // As far as I can tell, omitting the usual explicit destructor call
+      // is not UB in and of itself, and it's a slight perf win. The
+      // destructor is a no-op, because the moved-from Tensor is
+      // effectively an intrusive_ptr in the null state, so we don't need
+      // the behavior for correctness reasons either. Leaving this
+      // explanatory comment, including commented-out destructor call, to
+      // make this abundantly clear.
+      //
+      // payload.as_tensor.~Tensor();
+      memcpy(&payload, &rhs.payload, sizeof(payload));
+      new (&rhs.payload.as_tensor) at::Tensor(std::move(t));
+    } else if (rhs.isTensor()) {
+      rhs.swap(*this);
+      return;
+    } else {
+      std::swap(reinterpret_cast<char(&)[sizeof(payload)]>(*&payload), reinterpret_cast<char(&)[sizeof(payload)]>(*&rhs.payload));
+    }
     std::swap(is_intrusive_ptr, rhs.is_intrusive_ptr);
     std::swap(tag, rhs.tag);
   }
@@ -297,13 +335,8 @@ struct CAFFE2_API IValue final {
   // While some of these accessors could be generated through templates,
   // we prefer to write them manually for clarity
 
-  IValue(at::Tensor t) : tag(Tag::Tensor), is_intrusive_ptr(t.defined()) {
-    // Note: the undefined tensor is not refcounted, so while it
-    // is tagged as a tensor, is_intrusive_ptr is set to false.
-    // This is not an optional optimization: our incref call
-    // *will not* do the right thing when called on an
-    // undefined tensor.
-    payload.as_intrusive_ptr = t.unsafeReleaseTensorImpl();
+  IValue(at::Tensor t) : tag(Tag::Tensor), is_intrusive_ptr(false) {
+    new (&payload.as_tensor) at::Tensor(std::move(t));
   }
   bool isTensor() const {
     return Tag::Tensor == tag;
@@ -311,7 +344,7 @@ struct CAFFE2_API IValue final {
   at::Tensor toTensor() &&;
   at::Tensor toTensor() const&;
   at::TensorImpl* unsafeToTensorImpl() const {
-    return static_cast<at::TensorImpl*>(payload.as_intrusive_ptr);
+    return payload.as_tensor.unsafeGetTensorImpl();
   }
 
   const IValue& toIValue() const {
@@ -326,7 +359,7 @@ struct CAFFE2_API IValue final {
       : tag(Tag::Blob), is_intrusive_ptr(true) {
     // TODO (after Tensor merge) If we pass in a Blob holding a Tensor, extract
     // and store it as a Tensor instead.
-    payload.as_intrusive_ptr = blob.release();
+    payload.as_intrusive_ptr = blob.release() ?: static_cast<intrusive_ptr_target*>(c10::UndefinedTensorImpl::singleton());
   }
 
   /// @private [doxygen private]
@@ -565,7 +598,7 @@ struct CAFFE2_API IValue final {
   c10::intrusive_ptr<ivalue::EnumHolder> toEnumHolder() const&;
 
   // None
-  IValue() : payload{0}, tag(Tag::None), is_intrusive_ptr(false) {}
+  IValue() : tag(Tag::None), is_intrusive_ptr(false) {}
   bool isNone() const {
     return Tag::None == tag;
   }
@@ -665,7 +698,7 @@ struct CAFFE2_API IValue final {
     // This is not an optional optimization: our incref call
     // *will not* do the right thing when called on an
     // undefined generator.
-    payload.as_intrusive_ptr = g.unsafeReleaseGeneratorImpl();
+    payload.as_intrusive_ptr = g.unsafeReleaseGeneratorImpl() ?: static_cast<intrusive_ptr_target*>(c10::UndefinedTensorImpl::singleton());
   }
   bool isGenerator() const {
     return Tag::Generator == tag;
@@ -749,7 +782,7 @@ struct CAFFE2_API IValue final {
   const void* internalToPointer() const {
     TORCH_INTERNAL_ASSERT(
         isPtrType(), "Can only call internalToPointer() for pointer types");
-    return payload.as_intrusive_ptr;
+    return payload.as_intrusive_ptr != c10::UndefinedTensorImpl::singleton() ? payload.as_intrusive_ptr : nullptr;
   }
 
   TypePtr type() const;
@@ -815,7 +848,40 @@ struct CAFFE2_API IValue final {
       class NullType = c10::detail::intrusive_target_default_null_type<T>>
   c10::intrusive_ptr<T, NullType> toIntrusivePtr() const;
 
-  void clearToNone() {
+  void destroy() {
+    // We carefully construct this call to both 1) avoid UB by using
+    // the "wrong" one of as_tensor and as_intrusive_ptr and 2) enable
+    // the compiler to generate the same code for each case. It is
+    // surprisingly difficult to get this right.
+    if (isTensor() || is_intrusive_ptr) {
+      c10::intrusive_ptr_target* p = isTensor() ? payload.as_tensor.unsafeGetTensorImpl() : payload.as_intrusive_ptr;
+      c10::intrusive_ptr<intrusive_ptr_target, c10::UndefinedTensorImpl>::reclaim(p);
+      // No need to make this destructor call!
+      // payload.as_tensor.~Tensor();
+    }
+  }
+
+  C10_ALWAYS_INLINE void moveFrom(IValue&& rhs) noexcept {
+    if (rhs.isTensor()) {
+      new (&payload.as_tensor) at::Tensor(std::move(rhs.payload.as_tensor));
+      // As far as I can tell, omitting the usual explicit destructor call
+      // is not UB in and of itself, and it's a slight perf win. The
+      // destructor is a no-op, because the moved-from Tensor is
+      // effectively an intrusive_ptr in the null state, so we don't need
+      // the behavior for correctness reasons either. Leaving this
+      // explanatory comment, including commented-out destructor call, to
+      // make this abundantly clear.
+      //
+      // rhs.payload.as_tensor.~Tensor();
+    } else {
+      memcpy(&payload, &rhs.payload, sizeof(payload));
+    }
+    tag = rhs.tag;
+    is_intrusive_ptr = rhs.is_intrusive_ptr;
+    rhs.clearToNone();
+  }
+
+  void clearToNone() noexcept {
     payload.as_int = 0;
     tag = Tag::None;
     is_intrusive_ptr = false;
@@ -825,14 +891,27 @@ struct CAFFE2_API IValue final {
     int64_t as_int;
     double as_double;
     bool as_bool;
+    // Invariant: never nullptr; null state is represented as
+    // c10::UndefinedTensorImpl::singleton() for consistency of
+    // representation with Tensor.
     c10::intrusive_ptr_target* as_intrusive_ptr;
+    at::Tensor as_tensor;
     struct {
       DeviceType type;
       DeviceIndex index;
     } as_device;
+
+    Payload() : as_int(0) {}
+    ~Payload() {}
   };
 
-  IValue(Payload p, Tag t, bool i) : payload(p), tag(t), is_intrusive_ptr(i) {}
+  IValue(const Payload& p, Tag t, bool i) : tag(t), is_intrusive_ptr(i) {
+    if (isTensor()) {
+      new (&payload.as_tensor) at::Tensor(p.as_tensor);
+    } else {
+      memcpy(&payload, &p, sizeof(payload));
+    }
+  }
 
   Payload payload;
   Tag tag;
@@ -847,23 +926,30 @@ struct CAFFE2_API WeakIValue final {
       : payload(rhs.payload),
         tag(rhs.tag),
         is_intrusive_ptr(rhs.is_intrusive_ptr) {
-    if (is_intrusive_ptr) {
+    if (is_intrusive_ptr && payload.as_intrusive_ptr != c10::UndefinedTensorImpl::singleton()) {
       c10::raw::weak_intrusive_ptr::incref(payload.as_intrusive_ptr);
     }
   }
   WeakIValue(const IValue& rhs)
-      : payload(rhs.payload),
-        tag(rhs.tag),
+      : tag(rhs.tag),
         is_intrusive_ptr(rhs.is_intrusive_ptr) {
+    if (rhs.isTensor()) {
+      payload.as_intrusive_ptr = rhs.unsafeToTensorImpl();
+    } else {
+      static_assert(sizeof(payload) == sizeof(rhs.payload), "IValue and WeakIValue payload sizes don't match!");
+      memcpy(&payload, &rhs.payload, sizeof(payload));
+    }
     if (is_intrusive_ptr) {
-      c10::raw::weak_intrusive_ptr::incref(payload.as_intrusive_ptr);
+      if (payload.as_intrusive_ptr != c10::UndefinedTensorImpl::singleton()) {
+        c10::raw::weak_intrusive_ptr::incref(payload.as_intrusive_ptr);
+      }
     }
   }
   WeakIValue(WeakIValue&& rhs) noexcept : WeakIValue() {
     swap(rhs);
   }
   ~WeakIValue() {
-    if (is_intrusive_ptr) {
+    if (is_intrusive_ptr && payload.as_intrusive_ptr != c10::UndefinedTensorImpl::singleton()) {
       c10::raw::weak_intrusive_ptr::decref(payload.as_intrusive_ptr);
     }
   }
@@ -888,17 +974,32 @@ struct CAFFE2_API WeakIValue final {
 
   IValue lock() const {
     if (!is_intrusive_ptr) {
-      return IValue(payload, tag, false);
+      IValue::Payload newPayload;
+      memcpy(&newPayload, &payload, sizeof(newPayload));
+      return IValue(newPayload, tag, false);
     }
-    auto temp = c10::weak_intrusive_ptr<c10::intrusive_ptr_target>::reclaim(
-        payload.as_intrusive_ptr);
-    IValue::Payload pl;
-    pl.as_intrusive_ptr = temp.lock().release();
-    temp.release();
-    if (!pl.as_intrusive_ptr) {
-      return IValue();
+    if (IValue::Tag::Tensor == tag) {
+      auto temp = c10::weak_intrusive_ptr<at::TensorImpl, c10::UndefinedTensorImpl>::reclaim(
+          static_cast<at::TensorImpl*>(payload.as_intrusive_ptr));
+      c10::intrusive_ptr<at::TensorImpl, c10::UndefinedTensorImpl> ip(temp.lock());
+      if (!ip) {
+        return IValue();
+      } else {
+        return IValue(at::Tensor(std::move(ip)));
+      }
     } else {
-      return IValue(pl, tag, true);
+      auto temp = c10::weak_intrusive_ptr<c10::intrusive_ptr_target>::reclaim(
+          payload.as_intrusive_ptr == c10::UndefinedTensorImpl::singleton()
+          ? nullptr
+          : payload.as_intrusive_ptr);
+      IValue::Payload pl;
+      pl.as_intrusive_ptr = temp.lock().release();
+      temp.release();
+      if (!pl.as_intrusive_ptr) {
+        return IValue();
+      } else {
+        return IValue(pl, tag, true);
+      }
     }
   }
 
@@ -906,7 +1007,7 @@ struct CAFFE2_API WeakIValue final {
     if (!is_intrusive_ptr) {
       return 1;
     }
-    auto temp = c10::weak_intrusive_ptr<c10::intrusive_ptr_target>::reclaim(
+    auto temp = c10::weak_intrusive_ptr<c10::intrusive_ptr_target, c10::UndefinedTensorImpl>::reclaim(
         payload.as_intrusive_ptr);
     size_t result = temp.use_count();
     temp.release();
@@ -917,7 +1018,7 @@ struct CAFFE2_API WeakIValue final {
     if (!is_intrusive_ptr) {
       return 1;
     }
-    auto temp = c10::weak_intrusive_ptr<c10::intrusive_ptr_target>::reclaim(
+    auto temp = c10::weak_intrusive_ptr<c10::intrusive_ptr_target, c10::UndefinedTensorImpl>::reclaim(
         payload.as_intrusive_ptr);
     size_t result = temp.weak_use_count();
     temp.release();
@@ -928,7 +1029,19 @@ struct CAFFE2_API WeakIValue final {
   }
 
  private:
-  IValue::Payload payload;
+  union Payload {
+    int64_t as_int;
+    double as_double;
+    bool as_bool;
+    // Invariant: never nullptr; null state is represented as
+    // UndefinedTensorImpl::singleton() for consistency with Tensor.
+    c10::intrusive_ptr_target* as_intrusive_ptr;
+    struct {
+      DeviceType type;
+      DeviceIndex index;
+    } as_device;
+  };
+  Payload payload;
   IValue::Tag tag;
   bool is_intrusive_ptr;
 };
