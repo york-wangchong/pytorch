@@ -1,7 +1,9 @@
 import os
+import sys
 import fnmatch
 import warnings
 import tarfile
+import zipfile
 from typing import List, Union, Iterable, Any, Callable
 from io import BufferedIOBase
 
@@ -105,4 +107,25 @@ def extract_files_from_single_tar_pathname_binary(
             yield (inner_pathname, extract_fobj)
     except tarfile.TarError as e:
         warnings.warn("Unable to extract files from corrupted tarfile stream {}, abort!".format(pathname))
+        raise e
+
+
+def extract_files_from_single_zip_pathname_binary(
+        pathname : str,
+        binary_stream : Any,
+        zipfile_handle_register : List[tuple]):
+
+    try:
+        zips = zipfile.ZipFile(binary_stream)
+        zipfile_handle_register.append((pathname, zips))
+
+        for zipinfo in zips.infolist():
+            # major version should always be 3 here.
+            if (sys.version_info[1] < 6 and zipinfo.filename.endswith('/')) or zipinfo.is_dir():
+                continue
+
+            inner_pathname = os.path.normpath(os.path.join(pathname, zipinfo.filename))
+            yield (inner_pathname, zips.open(zipinfo))
+    except zipfile.BadZipFile as e:
+        warnings.warn("Unable to extract files from corrupted zipfile stream {}, abort!".format(pathname))
         raise e
